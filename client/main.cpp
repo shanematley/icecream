@@ -72,12 +72,16 @@ static void dcc_show_usage(void)
         "Usage:\n"
         "   icecc [compiler] [compile options] -o OBJECT -c SOURCE\n"
         "   icecc --build-native [compilertype] [file...]\n"
+        "   icecc --build-native {--compiler|-c} path_to_compiler [file...]\n"
+        "   icecc --build-native-from-env [file...]\n"
         "   icecc --help\n"
         "\n"
         "Options:\n"
         "   --help                     explain usage and exit\n"
         "   --version                  show version and exit\n"
         "   --build-native             create icecc environment\n"
+        "   --build-native-from-env    create icecc environment using the ICECC_CC and ICECC_CXX\n"
+        "                              environment variables\n"
         "Environment Variables:\n"
         "   ICECC                      if set to \"no\", just exec the real compiler\n"
         "   ICECC_VERSION              use a specific icecc environment, see icecc-create-env\n"
@@ -162,17 +166,93 @@ static string read_output(const char *command)
     return output.substr(0, output.length() - 1);
 }
 
+/* Get the c++ variant of a compiler name. Given a path it will return a string
+ * where "cc" is replaced with "++" in the file name portion of the path. */
+string get_cxx_name(string compiler_path)
+{
+    size_t idx = compiler_path.find_last_of('/');
+    if (idx == string::npos)
+        idx = 0;
+    size_t cc_idx = compiler_path.find("cc");
+    if (cc_idx != string::npos)
+        compiler_path.replace(cc_idx, 2, "++");
+    return compiler_path;
+}
+
+/* Get the c variant of a compiler name. Given a path it will return a string
+ * where "++" is replaced with "cc" in the file name portion of the path. */
+string get_cc_name(string compiler_path)
+{
+    size_t idx = compiler_path.find_last_of('/');
+    if (idx == string::npos)
+        idx = 0;
+    size_t cc_idx = compiler_path.find("++");
+    if (cc_idx != string::npos)
+        compiler_path.replace(cc_idx, 2, "cc");
+    return compiler_path;
+}
+
+/* Retrieve an environment variable into a string */
+string get_envvar(const char* name)
+{
+    const char* value = getenv(name);
+    return value != 0 ? string(value) : string();
+}
+
+static int add_clang_to_icecc_create_env_arguments(vector<char*>& argv, const string& clang_path)
+{
+    if (clang_path.empty()) {
+        log_error() << "clang compiler not found\n";
+        return 1;
+    }
+
+    struct stat st;
+    if (lstat(PLIBDIR "/compilerwrapper", &st)) {
+        log_error() << PLIBDIR "/compilerwrapper does not exist\n";
+        return 1;
+    }
+
+    argv.push_back(strdup("--clang"));
+    argv.push_back(strdup(clang_path.c_str()));
+    argv.push_back(strdup(PLIBDIR "/compilerwrapper"));
+    return 0;
+}
+
+static int add_gcc_to_icecc_create_env_arguments(vector<char*>& argv, const string& gxx, const string& gcc)
+{
+    // both C and C++ compiler are required
+    if (gxx.empty() || gcc.empty()) {
+        log_error() << "unable to find compiler\n";
+        return 1;
+    }
+
+    argv.push_back(strdup("--gcc"));
+    argv.push_back(strdup(gxx.c_str()));
+    argv.push_back(strdup(gcc.c_str()));
+    return 0;
+}
+
 /*
- * @param args Are [clang,gcc] [extra files...]
+ * @param args Are [(--compiler path)|clang|gcc] [extra files...]
  */
 static int create_native(char **args)
 {
     bool is_clang = false;
     char **extrafiles = args;
+    string compiler_path;
 
     // Args[0] maybe a compiler or the first extra file.
-    if (args[0] && ((!strcmp(args[0], "clang") && (is_clang = true))
-                    || !strcmp(args[0], "gcc"))) {
+    if (args[0] && (!strcmp(args[0], "--compiler") || !strcmp(args[0], "-c"))) {
+        if (!args[1]) {
+            log_error() << "invalid set of arguments: expecting compiler specification\n";
+            return 1;
+        }
+        compiler_path = args[1];
+        extrafiles += 2;
+    }
+    // Support old style of specifying just gcc or clang.
+    else if (args[0] && ((!strcmp(args[0], "clang") && (is_clang = true))
+                          || !strcmp(args[0], "gcc"))) {
         extrafiles++;
     }
 
@@ -186,22 +266,31 @@ static int create_native(char **args)
 
     argv.push_back(strdup(PLIBDIR "/icecc-create-env"));
 
-    if (is_clang) {
+    if (!compiler_path.empty()) {
+        // Use the path provided by the user. This will assume replacing "cc" for "++"
+        // and vice versa in the final file name is appropriate.
+        string cxx, cc;
+
+        if (compiler_path.find_first_of('/') != string::npos) {
+            // Got a path and filename. Just use these.
+            cxx = get_cxx_name(compiler_path);
+            cc = get_cc_name(compiler_path);
+        } else {
+            // Just a filename
+            cxx = compiler_path_lookup(get_cxx_name(compiler_path));
+            cc = compiler_path_lookup(get_cc_name(compiler_path));
+        }
+
+        const int ret = add_gcc_to_icecc_create_env_arguments(argv, cxx, cc);
+        if (ret)
+            return ret;
+    } else if (is_clang) {
         string clang = compiler_path_lookup("clang");
 
-        if (clang.empty()) {
-            log_error() << "clang compiler not found\n";
-            return 1;
-        }
+        const int ret = add_clang_to_icecc_create_env_arguments(argv, clang);
+        if (ret)
+            return ret;
 
-        if (lstat(PLIBDIR "/compilerwrapper", &st)) {
-            log_error() << PLIBDIR "/compilerwrapper does not exist\n";
-            return 1;
-        }
-
-        argv.push_back(strdup("--clang"));
-        argv.push_back(strdup(clang.c_str()));
-        argv.push_back(strdup(PLIBDIR "/compilerwrapper"));
     } else { // "gcc" (default)
         string gcc, gpp;
 
@@ -215,20 +304,58 @@ static int create_native(char **args)
             gpp = compiler_path_lookup("g++");
         }
 
-        // both C and C++ compiler are required
-        if (gcc.empty() || gpp.empty()) {
-            log_error() << "gcc compiler not found\n";
-            return 1;
-        }
-
-        argv.push_back(strdup("--gcc"));
-        argv.push_back(strdup(gcc.c_str()));
-        argv.push_back(strdup(gpp.c_str()));
+        const int ret = add_gcc_to_icecc_create_env_arguments(argv, gcc, gpp);
+        if (ret)
+            return ret;
     }
 
     for (int extracount = 0; extrafiles[extracount]; extracount++) {
         argv.push_back(strdup("--addfile"));
         argv.push_back(strdup(extrafiles[extracount]));
+    }
+
+    argv.push_back(NULL);
+
+    return execv(argv[0], argv.data());
+}
+
+/*
+ * @params args Are [extra files...]
+ */
+static int create_native_from_env(char **args)
+{
+    string cxx = get_envvar("ICECC_CXX");
+    string cc = get_envvar("ICECC_CC");
+
+    // If missing environment variables, fall back to old style.
+    if (cxx.empty() || cc.empty()) {
+        log_warning() << "ICECC_CXX or ICECC_CC not found. Defaulting to standard build-native\n";
+        return create_native(args);
+    }
+
+    vector<char*> argv;
+    struct stat st;
+
+    if (lstat(PLIBDIR "/icecc-create-env", &st)) {
+        log_error() << PLIBDIR "/icecc-create-env does not exist\n";
+        return 1;
+    }
+
+    argv.push_back(strdup(PLIBDIR "/icecc-create-env"));
+    int ret = 0;
+    if (cc.find("clang") == string::npos) {
+        ret = add_gcc_to_icecc_create_env_arguments(argv, cxx, cc);
+    } else {
+        ret = add_clang_to_icecc_create_env_arguments(argv, cc);
+    }
+
+    if (ret)
+        return ret;
+
+    // Add additional files
+    for (int extracount = 0; args[extracount]; extracount++) {
+        argv.push_back(strdup("--addfile"));
+        argv.push_back(strdup(args[extracount]));
     }
 
     argv.push_back(NULL);
@@ -281,6 +408,10 @@ int main(int argc, char **argv)
 
             if (arg == "--build-native") {
                 return create_native(argv + 2);
+            }
+
+            if (arg == "--build-native-from-env") {
+                return create_native_from_env(argv + 2);
             }
 
             if (arg.size() > 0) {
